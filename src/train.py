@@ -1,299 +1,231 @@
-"""
-JetRacer Lane Tracking - Training Script
-==========================================
-Two-phase training:
-  Phase 1: Freeze backbone, train regression head only (warm-up)
-  Phase 2: Unfreeze all layers, fine-tune with lower learning rate
+"""Train the compact model-only steering network from random weights."""
 
-Features:
-- Early stopping with patience
-- Best model checkpoint (by validation loss)
-- Training history logging
-- Automatic ONNX export after training
-"""
-
-import os
-import time
-import json
 import argparse
+import json
+import os
+import random
+import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from src.dataset_loader import create_dataloaders, PROJECT_ROOT
+from src.dataset_loader import PROJECT_ROOT, create_dataloaders
 from src.model import LaneTracker
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch.
-    
-    Returns:
-        Average training loss
-    """
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    for images, steerings in dataloader:
-        images = images.to(device)
-        steerings = steerings.to(device)
 
-        optimizer.zero_grad()
+def run_epoch(model, loader, criterion, device, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    loss_sum = 0.0
+    absolute_error_sum = 0.0
+    sample_count = 0
+
+    for images, targets in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
         predictions = model(images)
-        loss = criterion(predictions, steerings)
-        loss.backward()
-        optimizer.step()
+        loss = criterion(predictions, targets)
+        if training:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            optimizer.step()
+        count = int(targets.numel())
+        loss_sum += float(loss.item()) * count
+        absolute_error_sum += float(
+            torch.abs(predictions.detach() - targets).sum().item()
+        )
+        sample_count += count
 
-        total_loss += loss.item()
-        n_batches += 1
-
-    return total_loss / max(n_batches, 1)
+    denominator = max(sample_count, 1)
+    return loss_sum / denominator, absolute_error_sum / denominator
 
 
-@torch.no_grad()
-def validate(model, dataloader, criterion, device):
-    """Validate the model.
-    
-    Returns:
-        Average validation loss
-    """
-    model.eval()
-    total_loss = 0.0
-    n_batches = 0
-
-    for images, steerings in dataloader:
-        images = images.to(device)
-        steerings = steerings.to(device)
-
-        predictions = model(images)
-        loss = criterion(predictions, steerings)
-
-        total_loss += loss.item()
-        n_batches += 1
-
-    return total_loss / max(n_batches, 1)
+def save_checkpoint(model, optimizer, epoch, metrics, output_dir, filename):
+    torch.save({
+        'epoch': int(epoch),
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'metrics': dict(metrics),
+        'architecture': 'pilotnet_compact_v1',
+        'random_initialization': True,
+    }, os.path.join(output_dir, filename))
 
 
 def train(
     dataset_dir,
     output_dir='checkpoints',
-    batch_size=16,
-    phase1_epochs=5,
-    phase2_epochs=45,
-    phase1_lr=1e-3,
-    phase2_lr=1e-4,
-    weight_decay=1e-5,
-    patience=10,
+    batch_size=256,
+    epochs=40,
+    learning_rate=3e-4,
+    weight_decay=1e-4,
+    patience=8,
+    num_workers=0,
     device=None,
     seed=42,
+    loss_name='huber',
+    dropout=0.15,
+    augment_flip=True,
+    augment_recovery=False,
+    label_lookahead_frames=0,
 ):
-    """Full training pipeline.
-    
-    Args:
-        dataset_dir: Path to dataset_steering directory
-        output_dir: Directory to save checkpoints and logs
-        batch_size: Training batch size
-        phase1_epochs: Epochs for Phase 1 (frozen backbone)
-        phase2_epochs: Epochs for Phase 2 (fine-tuning)
-        phase1_lr: Learning rate for Phase 1
-        phase2_lr: Learning rate for Phase 2
-        weight_decay: L2 regularization
-        patience: Early stopping patience (Phase 2 only)
-        device: torch device (auto-detect if None)
-        seed: Random seed
-    """
-    # Setup
-    torch.manual_seed(seed)
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(device)
-    
-    print(f"Device: {device}")
+    set_seed(seed)
+    device = torch.device(
+        device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
+    )
     os.makedirs(output_dir, exist_ok=True)
+    print('Device: {}'.format(device))
 
-    # Data
-    print("\n" + "=" * 60)
-    print("Loading dataset...")
-    print("=" * 60)
     train_loader, val_loader, train_entries, val_entries = create_dataloaders(
-        dataset_dir, batch_size=batch_size, seed=seed
+        dataset_dir,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        seed=seed,
+        augment_flip=augment_flip,
+        augment_recovery=augment_recovery,
+        label_lookahead_frames=label_lookahead_frames,
     )
-
-    # Model
-    print("\n" + "=" * 60)
-    print("Creating model...")
-    print("=" * 60)
-    model = LaneTracker(pretrained=True, dropout=0.5)
-    model.to(device)
+    model = LaneTracker(pretrained=False, dropout=float(dropout)).to(device)
     trainable, total = model.count_parameters()
-    print(f"Parameters: {trainable:,} trainable / {total:,} total")
+    print('Random-init PilotNet: {:,} parameters'.format(total))
+    print('Trainable: {:,}'.format(trainable))
 
-    criterion = nn.MSELoss()
+    if loss_name == 'mse':
+        criterion = nn.MSELoss()
+    elif loss_name == 'huber':
+        criterion = nn.SmoothL1Loss(beta=0.08)
+    else:
+        raise ValueError('Unknown loss: {}'.format(loss_name))
+    optimizer = optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(int(epochs), 1), eta_min=learning_rate * 0.03
+    )
+
     history = {
-        'train_loss': [],
-        'val_loss': [],
-        'phase': [],
-        'lr': [],
+        'train_loss': [], 'val_loss': [],
+        'train_mae': [], 'val_mae': [], 'lr': [],
+        'train_samples': len(train_entries),
+        'val_samples': len(val_entries),
+        'architecture': 'pilotnet_compact_v1',
+        'random_initialization': True,
+        'loss': loss_name,
+        'dropout': float(dropout),
+        'augment_flip': bool(augment_flip),
+        'augment_recovery': bool(augment_recovery),
+        'label_lookahead_frames': int(label_lookahead_frames),
     }
-
-    best_val_loss = float('inf')
+    best_mae = float('inf')
     best_epoch = -1
-    epochs_no_improve = 0
+    epochs_without_improvement = 0
 
-    # =====================================================
-    # Phase 1: Freeze backbone, train head only
-    # =====================================================
-    print("\n" + "=" * 60)
-    print(f"Phase 1: Training regression head ({phase1_epochs} epochs, lr={phase1_lr})")
-    print("=" * 60)
-
-    model.freeze_backbone()
-    optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=phase1_lr,
-        weight_decay=weight_decay,
-    )
-
-    for epoch in range(phase1_epochs):
-        t0 = time.time()
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss = validate(model, val_loader, criterion, device)
-        elapsed = time.time() - t0
-
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['phase'].append(1)
-        history['lr'].append(phase1_lr)
-
-        marker = ""
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            save_checkpoint(model, optimizer, epoch, val_loss, output_dir, 'best_model.pth')
-            marker = " [BEST]"
-
-        print(
-            f"  Epoch {epoch + 1:3d}/{phase1_epochs} | "
-            f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-            f"Time: {elapsed:.1f}s{marker}"
+    for epoch in range(int(epochs)):
+        started = time.time()
+        train_loss, train_mae = run_epoch(
+            model, train_loader, criterion, device, optimizer=optimizer
         )
-
-    # =====================================================
-    # Phase 2: Unfreeze all, fine-tune
-    # =====================================================
-    print("\n" + "=" * 60)
-    print(f"Phase 2: Fine-tuning all layers ({phase2_epochs} epochs, lr={phase2_lr})")
-    print("=" * 60)
-
-    model.unfreeze_backbone()
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=phase2_lr,
-        weight_decay=weight_decay,
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
-    )
-
-    total_epoch_offset = phase1_epochs
-
-    for epoch in range(phase2_epochs):
-        global_epoch = total_epoch_offset + epoch
-        t0 = time.time()
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss = validate(model, val_loader, criterion, device)
-        elapsed = time.time() - t0
-
+        with torch.no_grad():
+            val_loss, val_mae = run_epoch(
+                model, val_loader, criterion, device, optimizer=None
+            )
         current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        history['phase'].append(2)
+        history['train_mae'].append(train_mae)
+        history['val_mae'].append(val_mae)
         history['lr'].append(current_lr)
 
-        scheduler.step(val_loss)
-
-        marker = ""
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = global_epoch
-            epochs_no_improve = 0
-            save_checkpoint(model, optimizer, global_epoch, val_loss, output_dir, 'best_model.pth')
-            marker = " [BEST]"
+        marker = ''
+        metrics = {'val_loss': val_loss, 'val_mae': val_mae}
+        if val_mae < best_mae - 1e-5:
+            best_mae = val_mae
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            save_checkpoint(
+                model, optimizer, epoch, metrics,
+                output_dir, 'best_model.pth'
+            )
+            marker = ' [BEST]'
         else:
-            epochs_no_improve += 1
+            epochs_without_improvement += 1
 
         print(
-            f"  Epoch {global_epoch + 1:3d}/{phase1_epochs + phase2_epochs} | "
-            f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-            f"LR: {current_lr:.2e} | Time: {elapsed:.1f}s{marker}"
+            'Epoch {:02d}/{:02d} train loss {:.5f} mae {:.4f} | '
+            'val loss {:.5f} mae {:.4f} | {:.1f}s{}'.format(
+                epoch + 1, epochs, train_loss, train_mae,
+                val_loss, val_mae, time.time() - started, marker,
+            ),
+            flush=True,
         )
-
-        # Early stopping
-        if epochs_no_improve >= patience:
-            print(f"\n  Early stopping! No improvement for {patience} epochs.")
+        if epochs_without_improvement >= int(patience):
+            print('Early stop after {} non-improving epochs'.format(patience))
             break
 
-    # =====================================================
-    # Save final results
-    # =====================================================
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print("=" * 60)
-    print(f"Best val loss: {best_val_loss:.6f} (epoch {best_epoch + 1})")
-
-    # Save last model
-    save_checkpoint(model, optimizer, global_epoch, val_loss, output_dir, 'last_model.pth')
-
-    # Save training history
-    history_path = os.path.join(output_dir, 'training_history.json')
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
-    print(f"Training history saved to {history_path}")
-
-    # Export ONNX
-    print("\nExporting best model to ONNX...")
-    best_checkpoint = torch.load(
-        os.path.join(output_dir, 'best_model.pth'),
-        map_location=device,
-        weights_only=True,
+    save_checkpoint(
+        model, optimizer, epoch,
+        {'val_loss': val_loss, 'val_mae': val_mae},
+        output_dir, 'last_model.pth'
     )
-    model.load_state_dict(best_checkpoint['model_state_dict'])
-    onnx_path = os.path.join(output_dir, 'lane_tracker.onnx')
-    model.export_onnx(onnx_path)
+    history['best_epoch'] = best_epoch + 1
+    history['best_val_mae'] = best_mae
+    with open(os.path.join(output_dir, 'training_history.json'), 'w') as handle:
+        json.dump(history, handle, indent=2)
 
+    try:
+        checkpoint = torch.load(
+            os.path.join(output_dir, 'best_model.pth'),
+            map_location='cpu', weights_only=True,
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            os.path.join(output_dir, 'best_model.pth'), map_location='cpu'
+        )
+    model.cpu()
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.export_onnx(os.path.join(
+        output_dir, 'lane_tracker_ir8_opset13.onnx'
+    ))
+    print('Best validation MAE: {:.5f} at epoch {}'.format(
+        best_mae, best_epoch + 1
+    ))
     return model, history
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, filename):
-    """Save model checkpoint."""
-    path = os.path.join(output_dir, filename)
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'val_loss': val_loss,
-    }, path)
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train JetRacer Lane Tracker')
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         '--dataset-dir',
-        type=str,
-        default=os.path.join(PROJECT_ROOT, 'dataset', 'track_lane_dataset', 'dataset_steering'),
-        help='Path to dataset_steering directory',
+        default=os.path.join(
+            PROJECT_ROOT, 'dataset', 'track_lane_dataset', 'dataset_steering'
+        ),
     )
-    parser.add_argument('--output-dir', type=str, default='checkpoints')
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--phase1-epochs', type=int, default=5)
-    parser.add_argument('--phase2-epochs', type=int, default=45)
-    parser.add_argument('--phase1-lr', type=float, default=1e-3)
-    parser.add_argument('--phase2-lr', type=float, default=1e-4)
-    parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--output-dir', default='checkpoints')
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--epochs', type=int, default=40)
+    parser.add_argument('--learning-rate', type=float, default=3e-4)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=8)
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--device', default=None)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--loss', choices=['mse', 'huber'], default='huber')
+    parser.add_argument('--dropout', type=float, default=0.15)
+    parser.add_argument('--no-flip', action='store_true')
+    parser.add_argument('--recovery', action='store_true')
+    parser.add_argument('--label-lookahead-frames', type=int, default=0)
     return parser.parse_args()
 
 
@@ -303,11 +235,16 @@ if __name__ == '__main__':
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
-        phase1_epochs=args.phase1_epochs,
-        phase2_epochs=args.phase2_epochs,
-        phase1_lr=args.phase1_lr,
-        phase2_lr=args.phase2_lr,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         patience=args.patience,
+        num_workers=args.num_workers,
         device=args.device,
         seed=args.seed,
+        loss_name=args.loss,
+        dropout=args.dropout,
+        augment_flip=not args.no_flip,
+        augment_recovery=args.recovery,
+        label_lookahead_frames=args.label_lookahead_frames,
     )

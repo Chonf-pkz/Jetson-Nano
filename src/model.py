@@ -1,232 +1,157 @@
-"""
-JetRacer Lane Tracking Model
-=============================
-ResNet-18 based steering regression model optimized for Jetson Nano.
-- Pretrained ImageNet backbone
-- Custom regression head with dropout
-- tanh output activation for [-1, 1] range
-- ONNX export for TensorRT deployment
-"""
+"""Compact PilotNet-style steering model trained from random initialization."""
 
 import torch
 import torch.nn as nn
-from torchvision import models
+
+from src.preprocessing_config import MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH
 
 
 class LaneTracker(nn.Module):
-    """ResNet-18 based lane tracking model.
-    
-    Takes a 224x224 RGB image and outputs a steering value in [-1, 1].
-    
-    Args:
-        pretrained: Use ImageNet pretrained weights
-        dropout: Dropout rate before final FC layer
-    """
+    """Fast end-to-end road steering network for Jetson Nano CPU inference."""
 
-    def __init__(self, pretrained=True, dropout=0.5):
+    def __init__(self, pretrained=False, dropout=0.20):
         super().__init__()
-
-        # Load ResNet-18 backbone
-        if pretrained:
-            weights = models.ResNet18_Weights.IMAGENET1K_V1
-        else:
-            weights = None
-        
-        backbone = models.resnet18(weights=weights)
-
-        # Remove the original FC layer, keep everything else
-        self.features = nn.Sequential(*list(backbone.children())[:-1])
-        
-        # Custom regression head
-        # ResNet-18 outputs 512-dim features after global avg pool
+        # ``pretrained`` remains in the API to reject accidental checkpoint
+        # reuse cleanly; this architecture always starts from random weights.
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2),
+            nn.ELU(inplace=True),
+            nn.Conv2d(48, 64, kernel_size=3),
+            nn.ELU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3),
+            nn.ELU(inplace=True),
+        )
         self.regressor = nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(p=dropout),
-            nn.Linear(512, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout * 0.5),
-            nn.Linear(128, 1),
+            nn.Dropout(float(dropout)),
+            nn.Linear(64 * 1 * 18, 100),
+            nn.ELU(inplace=True),
+            nn.Linear(100, 50),
+            nn.ELU(inplace=True),
+            nn.Linear(50, 10),
+            nn.ELU(inplace=True),
+            nn.Linear(10, 1),
         )
+        self._initialize_weights()
 
-    def forward(self, x):
-        """Forward pass.
-        
-        Args:
-            x: Input tensor of shape (B, 3, 224, 224)
-            
-        Returns:
-            Steering prediction of shape (B,) in range [-1, 1]
-        """
-        features = self.features(x)
-        out = self.regressor(features)
-        out = torch.tanh(out)
-        return out.squeeze(-1)
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    module.weight, nonlinearity='relu'
+                )
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, inputs):
+        features = self.features(inputs)
+        steering = self.regressor(features)
+        return torch.tanh(steering).squeeze(-1)
 
     def freeze_backbone(self):
-        """Freeze all backbone (feature extractor) parameters."""
-        for param in self.features.parameters():
-            param.requires_grad = False
-        print("Backbone frozen - only training regression head")
+        for parameter in self.features.parameters():
+            parameter.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Unfreeze all backbone parameters for fine-tuning."""
-        for param in self.features.parameters():
-            param.requires_grad = True
-        print("Backbone unfrozen - fine-tuning all layers")
+        for parameter in self.features.parameters():
+            parameter.requires_grad = True
 
     def count_parameters(self):
-        """Count trainable and total parameters."""
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(parameter.numel() for parameter in self.parameters())
+        trainable = sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
         return trainable, total
 
-    def export_onnx(self, filepath, input_size=(1, 3, 224, 224)):
-        """Export model to ONNX format for TensorRT on Jetson Nano.
-        
-        Args:
-            filepath: Output .onnx file path
-            input_size: Input tensor shape (batch, channels, height, width)
-        """
-        self.eval()
-        dummy_input = torch.randn(*input_size)
+    def export_onnx(self, filepath, input_size=None):
+        import onnx
 
+        if input_size is None:
+            input_size = (1, 3, MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH)
+        self.eval()
+        self.cpu()
+        dummy = torch.randn(*input_size, dtype=torch.float32)
         torch.onnx.export(
             self,
-            dummy_input,
+            dummy,
             filepath,
             input_names=['input'],
             output_names=['steering'],
-            dynamic_axes={
-                'input': {0: 'batch_size'},
-                'steering': {0: 'batch_size'},
-            },
-            opset_version=11,  # Compatible with Jetson Nano TensorRT
+            opset_version=13,
+            dynamo=False,
+            external_data=False,
+            do_constant_folding=True,
+            dynamic_axes=None,
         )
-        print(f"Model exported to ONNX: {filepath}")
+        model = onnx.load(filepath)
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.save(model, filepath)
+        print('Exported ONNX IR8/opset13: {}'.format(filepath))
 
 
 class SteeringPostProcessor:
-    """Post-processing for steering output with threshold and smoothing.
-    
-    Applies configurable rules to the raw model output:
-    - Dead zone: Small steering values below threshold → 0 (go straight)
-    - Clipping: Limit max steering angle
-    - Smoothing: Exponential moving average to reduce jitter
-    
-    This helps the car:
-    - Stay in lane without oscillating
-    - Not cross solid lane markings
-    - Allow crossing dashed lane markings when needed (wider threshold)
-    
-    Args:
-        dead_zone: Steering values with |value| < dead_zone are set to 0
-        max_steering: Maximum allowed steering magnitude
-        smoothing_alpha: EMA smoothing factor (0=full smooth, 1=no smooth)
-        solid_lane_limit: Max steering to avoid crossing solid lanes
-        dashed_lane_limit: Max steering allowed near dashed lanes (more permissive)
-    """
-
     def __init__(
         self,
-        dead_zone=0.05,
-        max_steering=0.8,
-        smoothing_alpha=0.7,
-        solid_lane_limit=0.6,
-        dashed_lane_limit=0.9,
+        dead_zone=0.04,
+        max_steering=0.80,
+        smoothing_alpha=0.35,
+        solid_lane_limit=0.80,
+        dashed_lane_limit=0.80,
+        steering_gain=1.0,
     ):
-        self.dead_zone = dead_zone
-        self.max_steering = max_steering
-        self.smoothing_alpha = smoothing_alpha
-        self.solid_lane_limit = solid_lane_limit
-        self.dashed_lane_limit = dashed_lane_limit
-        self._prev_steering = 0.0
+        self.dead_zone = float(dead_zone)
+        self.max_steering = float(max_steering)
+        self.smoothing_alpha = float(smoothing_alpha)
+        self.solid_lane_limit = float(solid_lane_limit)
+        self.dashed_lane_limit = float(dashed_lane_limit)
+        self.steering_gain = float(steering_gain)
+        self._previous = 0.0
 
     def process(self, raw_steering, lane_type='solid'):
-        """Process raw steering output.
-        
-        Args:
-            raw_steering: Raw model output in [-1, 1]
-            lane_type: 'solid' or 'dashed' — determines max steering limit
-            
-        Returns:
-            Processed steering value
-        """
-        steering = float(raw_steering)
-
-        # 1. Dead zone — ignore tiny steering noise
+        steering = float(raw_steering) * self.steering_gain
         if abs(steering) < self.dead_zone:
             steering = 0.0
-
-        # 2. Apply lane-type-specific limit
-        if lane_type == 'solid':
-            limit = self.solid_lane_limit
-        else:  # dashed
-            limit = self.dashed_lane_limit
-
-        # Clip to the more restrictive of max_steering and lane limit
-        effective_limit = min(self.max_steering, limit)
-        steering = max(-effective_limit, min(effective_limit, steering))
-
-        # 3. Exponential moving average smoothing
+        limit = min(self.max_steering, self.solid_lane_limit)
+        steering = max(-limit, min(limit, steering))
         steering = (
             self.smoothing_alpha * steering
-            + (1 - self.smoothing_alpha) * self._prev_steering
+            + (1.0 - self.smoothing_alpha) * self._previous
         )
-        self._prev_steering = steering
-
+        self._previous = steering
         return steering
 
     def reset(self):
-        """Reset smoothing state."""
-        self._prev_steering = 0.0
+        self._previous = 0.0
 
 
 def load_model(checkpoint_path, device='cpu'):
-    """Load a trained LaneTracker model from checkpoint.
-    
-    Args:
-        checkpoint_path: Path to .pth checkpoint file
-        device: Device to load model on
-        
-    Returns:
-        Loaded LaneTracker model in eval mode
-    """
     model = LaneTracker(pretrained=False)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    
+    try:
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=True
+        )
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    model.load_state_dict(state)
     model.to(device)
     model.eval()
-    print(f"Model loaded from {checkpoint_path}")
     return model
 
 
 if __name__ == '__main__':
-    # Quick test
-    model = LaneTracker(pretrained=True)
-    trainable, total = model.count_parameters()
-    print(f"Parameters: {trainable:,} trainable / {total:,} total")
-
-    # Test forward pass
-    dummy = torch.randn(4, 3, 224, 224)
-    output = model(dummy)
-    print(f"Input shape: {dummy.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"Output values: {output.detach()}")
-    print(f"Output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
-
-    # Test post-processor
-    pp = SteeringPostProcessor()
-    test_values = [0.02, -0.03, 0.5, -0.7, 1.0, -1.0]
-    for v in test_values:
-        processed = pp.process(v, lane_type='solid')
-        print(f"  Raw: {v:+.2f} → Processed (solid): {processed:+.4f}")
-    
-    pp.reset()
-    for v in test_values:
-        processed = pp.process(v, lane_type='dashed')
-        print(f"  Raw: {v:+.2f} → Processed (dashed): {processed:+.4f}")
+    network = LaneTracker()
+    sample = torch.randn(4, 3, MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH)
+    output = network(sample)
+    print('Output:', tuple(output.shape))
+    print('Parameters:', network.count_parameters())
